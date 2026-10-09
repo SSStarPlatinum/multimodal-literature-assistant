@@ -1,0 +1,47 @@
+# ===== Web 框架 =====
+fastapi>=0.110.0,<0.120.0
+uvicorn[standard]>=0.29.0,<0.35.0
+python-multipart>=0.0.9
+pydantic>=2.6.0,<3.0.0
+pydantic-settings>=2.2.0,<3.0.0
+
+# ===== 模型与推理 =====
+# transformers / torch / bitsandbytes 在 local 模式下需要；
+# api 模式下仅需 openai。固定合理主版本，避免 API 漂移。
+torch>=2.1.0
+transformers>=4.45.0,<5.0.0
+accelerate>=0.30.0
+sentencepiece>=0.2.0
+pillow>=10.0.0,<12.0.0
+openai>=1.30.0,<2.0.0
+
+# 4-bit 量化（仅 local + Linux GPU 容器）
+bitsandbytes>=0.43.0
+
+# 嵌入与重排序
+sentence-transformers>=2.7.0,<4.0.0
+
+# ===== RAG / 向量库 =====
+llama-index-core>=0.10.0,<0.13.0
+chromadb>=0.5.0,<1.0.0
+
+# ===== 文档解析 =====
+# PyMuPDF (fitz) 为主引擎：文本提取空格/布局准确率远高于 pdfplumber，
+# 同时支持嵌入图片提取、页面渲染。pdfplumber 保留作表格提取备选。
+PyMuPDF>=1.24.0,<2.0.0
+pdfplumber>=0.11.0
+PyPDF2>=3.0.0
+
+# ===== 知识图谱 =====
+neo4j>=5.20.0,<6.0.0
+
+# ===== 工具 =====
+httpx>=0.27.0,<1.0.0
+numpy>=1.26.0,<3.0.0
+
+# ===== 异步任务队列 =====
+celery[redis]>=5.3.0,<6.0.0
+redis>=5.0.0,<6.0.0
+
+# ===== 文档导出 =====
+python-docx>=1.1.0,<2.0.0

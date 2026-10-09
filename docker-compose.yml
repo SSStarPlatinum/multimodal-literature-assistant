@@ -1,0 +1,279 @@
+# ============================================================
+# 多模态文献精读与知识图谱助手 - Docker Compose 编排
+# 服务: frontend (Vue3) + backend (FastAPI) + neo4j (知识图谱)
+# ============================================================
+
+services:
+  # ===== Neo4j 知识图谱数据库 =====
+  neo4j:
+    image: neo4j:5.16-community
+    container_name: literature-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt 协议
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-literature2024}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2G
+      - NEO4J_dbms_memory_pagecache_size=1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      # neo4j 镜像只有 wget 没有 curl，用 wget -q -O /dev/null 检查 HTTP 状态
+      # 比 --spider 更可靠：下载页面内容到 /dev/null，HTTP 200 即成功
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      # 首次启动需初始化数据库、加载 apoc 插件，给足 90s 启动时间
+      start_period: 90s
+    networks:
+      - literature-net
+
+  # ===== Redis 缓存 / Celery 消息队列 =====
+  redis:
+    image: redis:7-alpine
+    container_name: literature-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-literature_redis_2024} --appendonly yes
+    # 不暴露宿主机端口，仅在内部网络供 backend / celery-worker 访问
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-literature_redis_2024}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - literature-net
+
+  # ===== 后端 FastAPI 服务 =====
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend.Dockerfile
+    container_name: literature-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      # 应用
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+      # 模型模式: local | api
+      - MODEL_MODE=${MODEL_MODE:-api}
+      # Qwen2.5-VL API 配置（api 模式）
+      - QWEN_API_BASE=${QWEN_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - QWEN_API_KEY=${QWEN_API_KEY:-}
+      - QWEN_API_MODEL=${QWEN_API_MODEL:-qwen2.5-vl-7b-instruct}
+      - QWEN_TEXT_API_MODEL=${QWEN_TEXT_API_MODEL:-qwen-plus}
+      # 视觉能力开关（纯文本模型如 DeepSeek 设为 false）
+      - VISION_ENABLED=${VISION_ENABLED:-true}
+      # Qwen2.5-VL 本地配置（local 模式）
+      - QWEN_MODEL_NAME=${QWEN_MODEL_NAME:-Qwen/Qwen2.5-VL-7B-Instruct}
+      - QWEN_MODEL_PATH=/models/Qwen2.5-VL-7B-Instruct
+      # 4-bit 量化（仅 local 模式生效）
+      - ENABLE_4BIT_QUANTIZATION=${ENABLE_4BIT_QUANTIZATION:-true}
+      - LOAD_IN_4BIT=${LOAD_IN_4BIT:-true}
+      - BNB_4BIT_COMPUTE_DTYPE=float16
+      - BNB_4BIT_QUANT_TYPE=nf4
+      - BNB_4BIT_USE_NESTED_QUANT=true
+      # Embedding BGE-M3
+      - EMBEDDING_MODEL_NAME=BAAI/bge-m3
+      - EMBEDDING_MODEL_PATH=/models/bge-m3
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+      - EMBEDDING_BATCH_SIZE=32
+      # 向量存储
+      - VECTOR_STORE_TYPE=chroma
+      - VECTOR_STORE_PATH=/app/data/vector_store
+      - VECTOR_COLLECTION_NAME=literature_chunks
+      - CHUNK_SIZE=512
+      - CHUNK_OVERLAP=50
+      # RAG
+      - RAG_TOP_K=5
+      - RAG_SUMMARY_TOP_K=3
+      - RAG_FULLTEXT_TOP_K=8
+      - RAG_ENABLE_RERANK=true
+      - RERANK_MODEL_NAME=BAAI/bge-reranker-v2-m3
+      - RERANK_TOP_N=5
+      # Neo4j（服务名作为主机名）
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-literature2024}
+      - NEO4J_DATABASE=neo4j
+      # 文件存储
+      - UPLOAD_DIR=/app/data/uploads
+      - MAX_UPLOAD_SIZE=52428800
+      - ALLOWED_EXTENSIONS=pdf,png,jpg,jpeg,tiff
+      # CORS
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:80,http://frontend:80
+      # 国内 HuggingFace 镜像
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - TRANSFORMERS_OFFLINE=0
+      # Redis / Celery 异步任务队列（broker 用 db0，结果后端用 db1）
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-literature_redis_2024}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-literature_redis_2024}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-literature_redis_2024}@redis:6379/1
+      # 公式识别：基于标号定位+文本提取，VL默认关闭（稳定可靠零成本）
+      - FORMULA_VL_ENABLED=${FORMULA_VL_ENABLED:-false}
+      - FORMULA_VL_MAX_PER_PAGE=${FORMULA_VL_MAX_PER_PAGE:-5}
+    volumes:
+      # 代码卷挂载：本地代码修改立即同步到容器，无需重新构建镜像（开发环境用）
+      - ./backend:/app
+      - backend_uploads:/app/data/uploads
+      - backend_vector:/app/data/vector_store
+      - backend_parsed:/app/data/parsed
+      - backend_figures:/app/data/figures
+      - backend_models:/models
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      celery-worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - literature-net
+
+  # ===== Celery Worker（异步解析任务消费者）=====
+  celery-worker:
+    # 复用 backend 同一镜像，保证依赖与运行时环境完全一致
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend.Dockerfile
+    container_name: literature-celery-worker
+    restart: unless-stopped
+    command: celery -A app.core.celery_app.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      # 与 backend 相同的全部环境变量（模型 / Neo4j / 文件存储 / RAG 等），
+      # worker 需要读写上传文件、调用模型 API、写 Neo4j 与向量库
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+      - MODEL_MODE=${MODEL_MODE:-api}
+      - QWEN_API_BASE=${QWEN_API_BASE:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - QWEN_API_KEY=${QWEN_API_KEY:-}
+      - QWEN_API_MODEL=${QWEN_API_MODEL:-qwen2.5-vl-7b-instruct}
+      - QWEN_TEXT_API_MODEL=${QWEN_TEXT_API_MODEL:-qwen-plus}
+      - VISION_ENABLED=${VISION_ENABLED:-true}
+      - QWEN_MODEL_NAME=${QWEN_MODEL_NAME:-Qwen/Qwen2.5-VL-7B-Instruct}
+      - QWEN_MODEL_PATH=/models/Qwen2.5-VL-7B-Instruct
+      - ENABLE_4BIT_QUANTIZATION=${ENABLE_4BIT_QUANTIZATION:-true}
+      - LOAD_IN_4BIT=${LOAD_IN_4BIT:-true}
+      - BNB_4BIT_COMPUTE_DTYPE=float16
+      - BNB_4BIT_QUANT_TYPE=nf4
+      - BNB_4BIT_USE_NESTED_QUANT=true
+      - EMBEDDING_MODEL_NAME=BAAI/bge-m3
+      - EMBEDDING_MODEL_PATH=/models/bge-m3
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+      - EMBEDDING_BATCH_SIZE=32
+      - VECTOR_STORE_TYPE=chroma
+      - VECTOR_STORE_PATH=/app/data/vector_store
+      - VECTOR_COLLECTION_NAME=literature_chunks
+      - CHUNK_SIZE=512
+      - CHUNK_OVERLAP=50
+      - RAG_TOP_K=5
+      - RAG_SUMMARY_TOP_K=3
+      - RAG_FULLTEXT_TOP_K=8
+      - RAG_ENABLE_RERANK=true
+      - RERANK_MODEL_NAME=BAAI/bge-reranker-v2-m3
+      - RERANK_TOP_N=5
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=${NEO4J_USER:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-literature2024}
+      - NEO4J_DATABASE=neo4j
+      - UPLOAD_DIR=/app/data/uploads
+      - MAX_UPLOAD_SIZE=52428800
+      - ALLOWED_EXTENSIONS=pdf,png,jpg,jpeg,tiff
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:80,http://frontend:80
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - TRANSFORMERS_OFFLINE=0
+      # Celery broker / result backend（worker 必须显式设置）
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-literature_redis_2024}
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-literature_redis_2024}@redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://:${REDIS_PASSWORD:-literature_redis_2024}@redis:6379/1
+      # 公式识别：基于标号定位+文本提取，VL默认关闭
+      - FORMULA_VL_ENABLED=${FORMULA_VL_ENABLED:-false}
+      - FORMULA_VL_MAX_PER_PAGE=${FORMULA_VL_MAX_PER_PAGE:-5}
+    # 与 backend 完全相同的四个数据卷：worker 需要读写上传文件与解析产物
+    volumes:
+      # 代码卷挂载：与 backend 共享同一份本地代码
+      - ./backend:/app
+      - backend_uploads:/app/data/uploads
+      - backend_vector:/app/data/vector_store
+      - backend_parsed:/app/data/parsed
+      - backend_figures:/app/data/figures
+      - backend_models:/models
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.core.celery_app inspect ping || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - literature-net
+
+  # ===== 前端 Vue3 应用 =====
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend.Dockerfile
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-/api/v1}
+    container_name: literature-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    environment:
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-/api/v1}
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost/ || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    networks:
+      - literature-net
+
+# ===== 数据卷 =====
+volumes:
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  backend_uploads:
+    driver: local
+  backend_vector:
+    driver: local
+  backend_parsed:
+    driver: local
+  backend_figures:
+    driver: local
+  backend_models:
+    driver: local
+  redis_data:
+    driver: local
+
+# ===== 网络 =====
+networks:
+  literature-net:
+    driver: bridge
